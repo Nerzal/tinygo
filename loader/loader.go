@@ -119,6 +119,7 @@ func Load(config *compileopts.Config, inputPkgs []string, clangHeaders string, t
 
 	// Parse the returned json from `go list`.
 	decoder := json.NewDecoder(buf)
+	var testImportPath string
 	for {
 		pkg := &Package{
 			program: p,
@@ -168,6 +169,48 @@ func Load(config *compileopts.Config, inputPkgs []string, clangHeaders string, t
 				}
 			}
 			return nil, err
+		}
+		if config.TestConfig.CompileTestBinary {
+			// When creating a test binary, `go list` will list up to 4 packages
+			// used for testing:
+			// * The original package, unmodified (no *_test.go files).
+			// * The to be tested package, with *_test.go files included. This
+			//   package has a different import path (such as "math [math.test]").
+			// * The _test packages (such as math_test) that can only access the
+			//   external API. It is given an import path such as
+			//   "math_test [math.test]".
+			// * The main package that actually calls all the test functions,
+			//   which is generated on demand.
+			// The second package replaces the first when building a test
+			// package. Unfortunately, //go:linkname pragmas aren't adjusted for
+			// the new import path (and thus link name). Additionally, the first
+			// package is useless in the build and only makes the build slower.
+			// Therefore, if we detect the second package remove the first and
+			// adjust the import path as if it is the first.
+			if pkg.ForTest != "" && pkg.ImportPath == pkg.ForTest+" ["+pkg.ForTest+".test]" {
+				// There can only be one package import path that is being
+				// tested.
+				if testImportPath != "" {
+					return nil, fmt.Errorf("found two test import paths: %#v and %#v", testImportPath, pkg.ForTest)
+				}
+				testImportPath = pkg.ForTest
+				// Delete the previous package (that this package overrides).
+				delete(p.Packages, testImportPath)
+				for i, pkg := range p.sorted {
+					if pkg.ImportPath == testImportPath {
+						p.sorted = append(p.sorted[:i], p.sorted[i+1:]...)
+						break
+					}
+				}
+				pkg.ImportPath = pkg.ForTest
+			}
+			if testImportPath != "" {
+				// Do not replace the import path, the new one has been replaced
+				// with the old one (see above).
+				if _, ok := pkg.ImportMap[testImportPath]; ok {
+					delete(pkg.ImportMap, testImportPath)
+				}
+			}
 		}
 		p.sorted = append(p.sorted, pkg)
 		p.Packages[pkg.ImportPath] = pkg
